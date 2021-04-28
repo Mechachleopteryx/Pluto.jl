@@ -4,3 +4,8 @@
 precompile.jl
 build
 Manifest.toml
+
+test/frontend/node_modules
+test/frontend/artifacts/*
+!test/frontend/artifacts/.gitkeep
+.DS_Store

@@ -11,6 +11,7 @@ import Pluto: update_save_run!, WorkspaceManager, ClientSession, ServerSession, 
         fakeclientA = ClientSession(:fakeA, nothing)
         fakeclientB = ClientSession(:fakeB, nothing)
         🍭 = ServerSession()
+        🍭.options.evaluation.workspace_use_distributed = true
         🍭.connected_clients[fakeclientA.id] = fakeclientA
         🍭.connected_clients[fakeclientB.id] = fakeclientB
 
@@ -27,10 +28,39 @@ import Pluto: update_save_run!, WorkspaceManager, ClientSession, ServerSession, 
 
         @test notebookA.path != notebookB.path
 
+        Sys.iswindows() && sleep(.5) # workaround for https://github.com/JuliaLang/julia/issues/39270
         update_save_run!(🍭, notebookA, notebookA.cells[1])
+        Sys.iswindows() && sleep(.5) # workaround for https://github.com/JuliaLang/julia/issues/39270
         update_save_run!(🍭, notebookB, notebookB.cells[1])
 
         @test notebookB.cells[1].errored == true
+
+        Sys.iswindows() && sleep(.5) # workaround for https://github.com/JuliaLang/julia/issues/39270
+        WorkspaceManager.unmake_workspace((🍭, notebookA))
+        Sys.iswindows() && sleep(.5) # workaround for https://github.com/JuliaLang/julia/issues/39270
+        WorkspaceManager.unmake_workspace((🍭, notebookB))
+    end
+    @testset "Variables with secret names" begin
+        fakeclient = ClientSession(:fake, nothing)
+        🍭 = ServerSession()
+        🍭.options.evaluation.workspace_use_distributed = false
+        🍭.connected_clients[fakeclient.id] = fakeclient
+
+        notebook = Notebook([
+            Cell("result = 1"),
+            Cell("result"),
+            Cell("elapsed_ns = 3"),
+            Cell("elapsed_ns"),
+        ])
+        fakeclient.connected_notebook = notebook
+
+        update_save_run!(🍭, notebook, notebook.cells[1:4])
+        @test notebook.cells[1].output.body == "1"
+        @test notebook.cells[2].output.body == "1"
+        @test notebook.cells[3].output.body == "3"
+        @test notebook.cells[4].output.body == "3"
+        
+        WorkspaceManager.unmake_workspace((🍭, notebook))
     end
 
     @testset "notebook environment" begin

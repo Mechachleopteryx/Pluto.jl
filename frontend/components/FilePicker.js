@@ -1,4 +1,4 @@
-import { html, Component } from "../common/Preact.js"
+import { html, Component } from "../imports/Preact.js"
 
 import { utf8index_to_ut16index } from "../common/UnicodeTools.js"
 import { map_cmd_to_ctrl_on_mac } from "../common/KeyboardShortcuts.js"
@@ -28,16 +28,19 @@ export class FilePicker extends Component {
             window.dispatchEvent(new CustomEvent("collapse_cell_selection", {}))
         }
 
-        this.on_submit = () => {
+        this.on_submit = async () => {
             const my_val = this.cm.getValue()
             if (my_val === this.forced_value) {
                 this.suggest_not_tmp()
                 return
             }
-            this.props.on_submit(this.cm.getValue(), () => {
+            try {
+                await this.props.on_submit(this.cm.getValue())
+                this.cm.blur()
+            } catch (error) {
                 this.cm.setValue(this.props.value)
                 deselect(this.cm)
-            })
+            }
         }
     }
     componentDidUpdate() {
@@ -56,7 +59,7 @@ export class FilePicker extends Component {
                 value: "",
                 lineNumbers: false,
                 lineWrapping: false,
-                theme: "plutoheader",
+                theme: "nothing",
                 viewportMargin: Infinity,
                 placeholder: this.props.placeholder,
                 indentWithTabs: true,
