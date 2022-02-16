@@ -78,10 +78,14 @@ export const request_binder = (build_url) =>
         }
     })
 
+// view stats on https://stats.plutojl.org/
+export const count_stat = (page) =>
+    fetch(`https://stats.plutojl.org/count?p=/${page}&s=${screen.width},${screen.height},${devicePixelRatio}#skip_sw`, { cache: "no-cache" }).catch(() => {})
+
 export const start_binder = async ({ setStatePromise, connect, launch_params }) => {
     try {
         // view stats on https://stats.plutojl.org/
-        fetch(`https://stats.plutojl.org/count?p=/binder-start#skip_sw`, { cache: "no-cache" }).catch(() => {})
+        count_stat(`binder-start`)
         await setStatePromise(
             immer((state) => {
                 state.binder_phase = BinderPhase.requesting
@@ -147,13 +151,14 @@ export const start_binder = async ({ setStatePromise, connect, launch_params }) 
                 state.binder_phase = BinderPhase.notebook_running
             })
         )
-        console.log("Connecting ws")
+        console.log("Connecting WebSocket")
 
         const connect_promise = connect(with_token(ws_address_from_base(binder_session_url) + "channels"))
-        await timeout_promise(connect_promise, 10_000).catch(() => {
+        await timeout_promise(connect_promise, 20_000).catch((e) => {
+            console.error("Failed to establish connection within 20 seconds. Navigating to the edit URL directly.", e)
             const edit_url = new URL("edit", binder_session_url)
             edit_url.searchParams.set("id", new_notebook_id)
-            window.location.href = with_token(edit_url)
+            window.parent.location.href = with_token(edit_url)
         })
     } catch (err) {
         console.error("Failed to initialize binder!", err)

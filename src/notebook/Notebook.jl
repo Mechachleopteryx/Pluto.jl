@@ -6,11 +6,9 @@ import Pkg
 
 mutable struct BondValue
     value::Any
-    # This is only so the client can send this, the updater will always put this to `false`
-    is_first_value::Bool
 end
-function Base.convert(::Type{BondValue}, dict::Dict)
-    BondValue(dict["value"], something(get(dict, "is_first_value", false), false))
+function Base.convert(::Type{BondValue}, dict::AbstractDict)
+    BondValue(dict["value"])
 end
 
 const ProcessStatus = (
@@ -28,7 +26,7 @@ Base.@kwdef mutable struct Notebook
     
     path::String
     notebook_id::UUID=uuid1()
-    topology::NotebookTopology=NotebookTopology()
+    topology::NotebookTopology
     _cached_topological_order::Union{Nothing,TopologicalOrder}=nothing
 
     # buffer will contain all unfetched updates - must be big enough
@@ -52,30 +50,39 @@ Base.@kwdef mutable struct Notebook
 
     process_status::String=ProcessStatus.starting
     wants_to_interrupt::Bool=false
+    last_save_time::typeof(time())=time()
+    last_hot_reload_time::typeof(time())=zero(time())
 
     bonds::Dict{Symbol,BondValue}=Dict{Symbol,BondValue}()
 end
 
-Notebook(cells::Array{Cell,1}, path::AbstractString, notebook_id::UUID) = Notebook(
+_collect_cells(cells_dict::Dict{UUID,Cell}, cells_order::Vector{UUID}) = 
+    map(i -> cells_dict[i], cells_order)
+_initial_topology(cells_dict::Dict{UUID,Cell}, cells_order::Vector{UUID}) =
+    NotebookTopology(;
+        cell_order=ImmutableVector(_collect_cells(cells_dict, cells_order)),
+    )
+    
+function Notebook(cells::Vector{Cell}, path::AbstractString, notebook_id::UUID)
     cells_dict=Dict(map(cells) do cell
         (cell.cell_id, cell)
-    end),
-    cell_order=map(x -> x.cell_id, cells),
-    path=path,
-    notebook_id=notebook_id,
-)
+    end)
+    cell_order=map(x -> x.cell_id, cells)
+    Notebook(;
+        cells_dict, cell_order,
+        topology=_initial_topology(cells_dict, cell_order),
+        path=path,
+        notebook_id=notebook_id,
+    )
+end
 
-Notebook(cells::Array{Cell,1}, path::AbstractString=numbered_until_new(joinpath(new_notebooks_directory(), cutename()))) = Notebook(cells, path, uuid1())
+Notebook(cells::Vector{Cell}, path::AbstractString=numbered_until_new(joinpath(new_notebooks_directory(), cutename()))) = Notebook(cells, path, uuid1())
 
 function Base.getproperty(notebook::Notebook, property::Symbol)
     if property == :cells
-        cells_dict = getfield(notebook, :cells_dict)
-        cell_order = getfield(notebook, :cell_order)
-        map(cell_order) do id
-            cells_dict[id]
-        end
+        _collect_cells(notebook.cells_dict, notebook.cell_order)
     elseif property == :cell_inputs
-        getfield(notebook, :cells_dict)
+        notebook.cells_dict
     else
         getfield(notebook, property)
     end
@@ -129,11 +136,8 @@ function save_notebook(io, notebook::Notebook)
     using_plutopkg = notebook.nbpkg_ctx !== nothing
     
     write_package = if using_plutopkg
-        ptoml_path = joinpath(PkgCompat.env_dir(notebook.nbpkg_ctx), "Project.toml")
-        mtoml_path = joinpath(PkgCompat.env_dir(notebook.nbpkg_ctx), "Manifest.toml")
-        
-        ptoml_contents = isfile(ptoml_path) ? read(ptoml_path, String) : ""
-        mtoml_contents = isfile(mtoml_path) ? read(mtoml_path, String) : ""
+        ptoml_contents = PkgCompat.read_project_file(notebook)
+        mtoml_contents = PkgCompat.read_manifest_file(notebook)
         
         !isempty(strip(ptoml_contents))
     else
@@ -168,15 +172,15 @@ function save_notebook(io, notebook::Notebook)
     notebook
 end
 
-function open_safe_write(fn::Function, path, mode)
+function write_buffered(fn::Function, path)
     file_content = sprint(fn)
-    open(path, mode) do io
-        print(io, file_content)
-    end
+    write(path, file_content)
 end
     
 function save_notebook(notebook::Notebook, path::String)
-    open_safe_write(path, "w") do io
+    # @warn "Saving to file!!" exception=(ErrorException(""), backtrace())
+    notebook.last_save_time = time()
+    write_buffered(path) do io
         save_notebook(io, notebook)
     end
 end
@@ -201,7 +205,6 @@ function load_notebook_nobackup(io, path)::Notebook
     # ignore first bits of file
     readuntil(io, _cell_id_delimiter)
 
-    last_read = ""
     while !eof(io)
         cell_id_str = String(readline(io))
         if cell_id_str == "Cell order:"
@@ -222,7 +225,7 @@ function load_notebook_nobackup(io, path)::Notebook
     cell_order = UUID[]
     while !eof(io)
         cell_id_str = String(readline(io))
-        if length(cell_id_str) >= 36
+        if length(cell_id_str) >= 36 && (startswith(cell_id_str, _order_delimiter_folded) || startswith(cell_id_str, _order_delimiter))
             cell_id = let
                 UUID(cell_id_str[end - 35:end])
             end
@@ -269,12 +272,28 @@ function load_notebook_nobackup(io, path)::Notebook
         PkgCompat.create_empty_ctx()
     end
 
-    appeared_order = setdiff(cell_order ∩ keys(collected_cells), [_ptoml_cell_id, _mtoml_cell_id])
+    appeared_order = setdiff!(
+        union!(
+            # don't include cells that only appear in the order, but no code was given
+            intersect!(cell_order, keys(collected_cells)),
+            # add cells that appeared in code, but not in the order.
+            keys(collected_cells)
+        ), 
+        # remove Pkg cells
+        (_ptoml_cell_id, _mtoml_cell_id)
+    )
     appeared_cells_dict = filter(collected_cells) do (k, v)
         k ∈ appeared_order
     end
 
-    Notebook(cells_dict=appeared_cells_dict, cell_order=appeared_order, path=path, nbpkg_ctx=nbpkg_ctx, nbpkg_installed_versions_cache=nbpkg_cache(nbpkg_ctx))
+    Notebook(;
+        cells_dict=appeared_cells_dict, 
+        cell_order=appeared_order,
+        topology=_initial_topology(appeared_cells_dict, appeared_order),
+        path=path, 
+        nbpkg_ctx=nbpkg_ctx, 
+        nbpkg_installed_versions_cache=nbpkg_cache(nbpkg_ctx),
+    )
 end
 
 function load_notebook_nobackup(path::String)::Notebook
@@ -302,7 +321,7 @@ function load_notebook(path::String; disable_writing_notebook_files::Bool=false)
     update_dependency_cache!(loaded)
 
     disable_writing_notebook_files || save_notebook(loaded)
-    loaded.topology = NotebookTopology()
+    loaded.topology = NotebookTopology(; cell_order=ImmutableVector(loaded.cells))
 
     disable_writing_notebook_files || if only_versions_or_lineorder_differ(path, backup_path)
         rm(backup_path)
@@ -313,17 +332,19 @@ function load_notebook(path::String; disable_writing_notebook_files::Bool=false)
     loaded
 end
 
+_after_first_cell(lines) = lines[something(findfirst(startswith(_cell_id_delimiter), lines), 1):end]
+
 """
 Check if two savefiles are identical, up to their version numbers and a possible line shuffle.
 
 If a notebook has not yet had all of its cells analysed, we can't deduce the topological cell order. (but can we ever??) (no)
 """
 function only_versions_or_lineorder_differ(pathA::AbstractString, pathB::AbstractString)::Bool
-    Set(readlines(pathA)[3:end]) == Set(readlines(pathB)[3:end])
+    Set(readlines(pathA) |> _after_first_cell) == Set(readlines(pathB) |> _after_first_cell)
 end
 
 function only_versions_differ(pathA::AbstractString, pathB::AbstractString)::Bool
-    readlines(pathA)[3:end] == readlines(pathB)[3:end]
+    readlines(pathA) |> _after_first_cell == readlines(pathB) |> _after_first_cell
 end
 
 "Set `notebook.path` to the new value, save the notebook, verify file integrity, and if all OK, delete the old savefile. Normalizes the given path to make it absolute. Moving is always hard. 😢"

@@ -23,7 +23,9 @@ function use_plutopkg(topology::NotebookTopology)
         Symbol("Pkg.API.add") ∈ node.references ||
         # https://juliadynamics.github.io/DrWatson.jl/dev/project/#DrWatson.quickactivate
         Symbol("quickactivate") ∈ node.references ||
-        Symbol("@quickactivate") ∈ node.references
+        Symbol("@quickactivate") ∈ node.references ||
+        Symbol("DrWatson.@quickactivate") ∈ node.references ||
+        Symbol("DrWatson.quickactivate") ∈ node.references
     end
 end
 
@@ -55,13 +57,13 @@ function sync_nbpkg_core(notebook::Notebook; on_terminal_output::Function=((args
     use_plutopkg_new = use_plutopkg(notebook.topology)
     
     if !use_plutopkg_old && use_plutopkg_new
-        @info "Started using PlutoPkg!! HELLO reproducibility!"
+        @debug "Started using PlutoPkg!! HELLO reproducibility!"
 
         👺 = true
         notebook.nbpkg_ctx = PkgCompat.create_empty_ctx()
     end
     if use_plutopkg_old && !use_plutopkg_new
-        @info "Stopped using PlutoPkg 💔😟😢"
+        @debug "Stopped using PlutoPkg 💔😟😢"
 
         no_packages_loaded_yet = (
             notebook.nbpkg_restart_required_msg === nothing &&
@@ -198,7 +200,7 @@ function sync_nbpkg_core(notebook::Notebook; on_terminal_output::Function=((args
                         pushfirst!(LOAD_PATH, env_dir)
 
                         # update registries if this is the first time
-                        PkgCompat.update_registries(notebook.nbpkg_ctx)
+                        PkgCompat.update_registries(; force=false)
                         # instantiate without forcing registry update
                         PkgCompat.instantiate(notebook.nbpkg_ctx; update_registry=false)
                         
@@ -265,17 +267,17 @@ function sync_nbpkg(session, notebook; save::Bool=true)
 
 			if pkg_result.restart_recommended
 				@debug "PlutoPkg: Notebook restart recommended"
-				notebook.nbpkg_restart_recommended_msg = "yes"
+				notebook.nbpkg_restart_recommended_msg = "Yes, something changed during regular sync."
 			end
 			if pkg_result.restart_required
 				@debug "PlutoPkg: Notebook restart REQUIRED"
-				notebook.nbpkg_restart_required_msg = "yes"
+				notebook.nbpkg_restart_required_msg = "Yes, something changed during regular sync."
 			end
 
 			notebook.nbpkg_busy_packages = String[]
             update_nbpkg_cache!(notebook)
 			send_notebook_changes!(ClientRequest(session=session, notebook=notebook))
-			save && save_notebook(notebook)
+			save && save_notebook(session, notebook)
 		end
 	catch e
 		bt = catch_backtrace()
@@ -297,12 +299,12 @@ function sync_nbpkg(session, notebook; save::Bool=true)
 
 		# Clear the embedded Project and Manifest and require a restart from the user.
 		reset_nbpkg(notebook; keep_project=false, save=save)
-		notebook.nbpkg_restart_required_msg = "yes"
+		notebook.nbpkg_restart_required_msg = "Yes, because sync_nbpkg_core failed. \n\n$(error_text)"
         notebook.nbpkg_ctx_instantiated = false
         update_nbpkg_cache!(notebook)
 		send_notebook_changes!(ClientRequest(session=session, notebook=notebook))
 
-		save && save_notebook(notebook)
+		save && save_notebook(session, notebook)
 	end
 end
 
@@ -358,6 +360,7 @@ function update_nbpkg_core(notebook::Notebook; level::Pkg.UpgradeLevel=Pkg.UPLEV
                 notebook.nbpkg_ctx = PkgCompat.clear_stdlib_compat_entries(notebook.nbpkg_ctx)
                 PkgCompat.withio(notebook.nbpkg_ctx, IOContext(iolistener.buffer, :color => true)) do
                     withinteractive(false) do
+                        PkgCompat.update_registries(;force=false)
                         try
                             Pkg.resolve(notebook.nbpkg_ctx)
                         catch e
@@ -425,11 +428,11 @@ function update_nbpkg(session, notebook::Notebook; level::Pkg.UpgradeLevel=Pkg.U
 		if pkg_result.did_something
 			if pkg_result.restart_recommended
 				@debug "PlutoPkg: Notebook restart recommended"
-				notebook.nbpkg_restart_recommended_msg = "yes"
+				notebook.nbpkg_restart_recommended_msg = "Yes, something changed during regular update_nbpkg."
 			end
 			if pkg_result.restart_required
 				@debug "PlutoPkg: Notebook restart REQUIRED"
-				notebook.nbpkg_restart_required_msg = "yes"
+				notebook.nbpkg_restart_required_msg = "Yes, something changed during regular update_nbpkg."
 			end
 		else
             isfile(bp) && rm(bp)
@@ -438,7 +441,7 @@ function update_nbpkg(session, notebook::Notebook; level::Pkg.UpgradeLevel=Pkg.U
 		notebook.nbpkg_busy_packages = String[]
         update_nbpkg_cache!(notebook)
 		send_notebook_changes!(ClientRequest(session=session, notebook=notebook))
-		save && save_notebook(notebook)
+		save && save_notebook(session, notebook)
 	end
 end
 
@@ -449,6 +452,37 @@ nbpkg_cache(ctx::Union{Nothing,PkgContext}) = ctx === nothing ? Dict{String,Stri
 function update_nbpkg_cache!(notebook::Notebook)
     notebook.nbpkg_installed_versions_cache = nbpkg_cache(notebook.nbpkg_ctx)
     notebook
+end
+
+function is_nbpkg_equal(a::Union{Nothing,PkgContext}, b::Union{Nothing,PkgContext})::Bool
+    if (a isa Nothing) != (b isa Nothing)
+        the_other = something(a, b)
+        
+        ptoml_contents = PkgCompat.read_project_file(the_other)
+        the_other_is_empty = isempty(strip(ptoml_contents))
+        
+        if the_other_is_empty
+            # then both are essentially 'empty' environments, i.e. equal
+            true
+        else
+            # they are different
+            false
+        end
+    elseif a isa Nothing
+        true
+    else
+        ptoml_contents_a = strip(PkgCompat.read_project_file(a))
+        ptoml_contents_b = strip(PkgCompat.read_project_file(b))
+        
+        if ptoml_contents_a == ptoml_contents_b == ""
+            true
+        else
+            mtoml_contents_a = strip(PkgCompat.read_project_file(a))
+            mtoml_contents_b = strip(PkgCompat.read_project_file(b))
+            
+            (ptoml_contents_a == ptoml_contents_b) && (mtoml_contents_a == mtoml_contents_b)
+        end
+    end
 end
 
 const is_interactive_defined = isdefined(Base, :is_interactive) && !Base.isconst(Base, :is_interactive)

@@ -2,6 +2,7 @@ import Pluto
 import Pluto.ExpressionExplorer
 import Pluto.ExpressionExplorer: SymbolsState, compute_symbolreferences, FunctionNameSignaturePair, UsingsImports, compute_usings_imports
 using Test
+import Distributed
 
 function Base.show(io::IO, s::SymbolsState)
     print(io, "SymbolsState([")
@@ -21,9 +22,13 @@ function Base.show(io::IO, s::SymbolsState)
         end
         print(io, "]")
     end
-    print(io, "], [")
-    print(io, s.macrocalls)
-    print(io, "])")
+    if !isempty(s.macrocalls)
+        print(io, "], [")
+        print(io, s.macrocalls)
+        print(io, "])")
+    else
+        print(io, ")")
+    end
 end
 
 "Calls `ExpressionExplorer.compute_symbolreferences` on the given `expr` and test the found SymbolsState against a given one, with convient syntax.
@@ -83,6 +88,13 @@ function testee(expr, expected_references, expected_definitions, expected_funcca
     return expected == result
 end
 
+"""
+Like `testee` but actually a convenient syntax
+"""
+function test_expression_explorer(; expr, references=[], definitions=[], funccalls=[], funcdefs=[], macrocalls=[])
+    testee(expr, references, definitions, funccalls, funcdefs, macrocalls)
+end
+
 function easy_symstate(expected_references, expected_definitions, expected_funccalls, expected_funcdefs, expected_macrocalls = [])
     array_to_set(array) = map(array) do k
         new_k = k isa Symbol ? [k] : k
@@ -105,8 +117,8 @@ function setcode(cell, newcode)
     cell.code = newcode
 end
 
-function noerror(cell)
-    if cell.errored
+function noerror(cell; verbose=true)
+    if cell.errored && verbose
         @show cell.output.body
     end
     !cell.errored
@@ -117,13 +129,20 @@ function occursinerror(needle, haystack::Pluto.Cell)
 end
 
 "Test notebook equality, ignoring cell UUIDs and such."
-function notebook_inputs_equal(nbA, nbB; check_paths_equality=true)
-    x = !check_paths_equality || (normpath(nbA.path) == normpath(nbB.path))
-
-    to_compare(cell) = (cell.cell_id, cell.code_folded, cell.code)
-    y = to_compare.(nbA.cells) == to_compare.(nbB.cells)
-    
-    x && y
+macro test_notebook_inputs_equal(nbA, nbB, check_paths_equality::Bool=true)
+    quote
+        nbA = $(esc(nbA))
+        nbB = $(esc(nbB))
+        if $(check_paths_equality)
+            @test normpath(nbA.path) == normpath(nbB.path)
+        end
+        
+        @test length(nbA.cells) == length(nbB.cells)
+        @test getproperty.(nbA.cells, :cell_id) == getproperty.(nbB.cells, :cell_id)
+        @test getproperty.(nbA.cells, :code_folded) == getproperty.(nbB.cells, :code_folded)
+        @test getproperty.(nbA.cells, :code) == getproperty.(nbB.cells, :code)
+        
+    end |> Base.remove_linenums!
 end
 
 "Whether the given .jl file can be run without any errors. While notebooks cells can be in arbitrary order, their order in the save file must be topological.
@@ -181,3 +200,12 @@ has_embedded_pkgfiles(contents::AbstractString) =
 
 has_embedded_pkgfiles(nb::Pluto.Notebook) = 
     read(nb.path, String) |> has_embedded_pkgfiles
+
+"""
+Log an error message if there are any running processes created by Distrubted, that were not shut down.
+"""
+function verify_no_running_processes()
+    if length(Distributed.procs()) != 1
+        @error "Not all notebook processes were closed during tests!" Distributed.procs()
+    end
+end
